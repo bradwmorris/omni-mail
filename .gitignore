@@ -1,0 +1,30 @@
+__pycache__/
+.venv/
+.env*
+node_modules/
+web/dist/
+*.sqlite3*
+*credentials*.json
+*token*.json
+
+# Private planning and local mail, model and notebook artifacts.
+/PLAN.md
+.ipynb_checkpoints/
+*.csv
+*.jsonl
+*.ndjson
+*.mbox
+*.eml
+*.safetensors
+*.gguf
+*.npz
+client_secret*.json
+
+# Review future lab files before making them eligible for Git.
+/omni-mail-lab/*
+!/omni-mail-lab/README.md
+!/omni-mail-lab/tune-omni-600m.ipynb
+!/omni-mail-lab/tune-d1-2b.ipynb
+!/omni-mail-lab/examples/
+/omni-mail-lab/examples/*
+!/omni-mail-lab/examples/sample-labels.csv

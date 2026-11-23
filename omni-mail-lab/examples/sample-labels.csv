@@ -1,0 +1,13 @@
+id,group_id,sender,subject,body,label
+sample-01,group-01,workshop@example.invalid,Please confirm your seat,Could you reply by Friday to confirm your place in the workshop?,yes
+sample-02,group-02,billing@example.invalid,Payment failed,Please update the payment method on your active workspace before Tuesday.,yes
+sample-03,group-03,project@example.invalid,Approval needed,Can you approve the draft by the end of the day so we can publish it?,yes
+sample-04,group-04,support@example.invalid,Photos needed,Please send two pictures of the damaged part so we can finish your support request.,yes
+sample-05,group-05,team@example.invalid,Production deploy blocked,Your production release is blocked. Renew the signing certificate to deploy.,yes
+sample-06,group-06,studio@example.invalid,We need your preferred date,Please choose one of the two dates and reply by tomorrow.,yes
+sample-07,group-07,notes@example.invalid,Meeting notes,Here are the notes from today. I'll send the revised draft next week.,no
+sample-08,group-08,shop@example.invalid,Your order receipt,Payment went through. This receipt is for your records.,no
+sample-09,group-09,news@example.invalid,Monthly digest,This month's digest includes three articles on building small tools.,no
+sample-10,group-10,offers@example.invalid,An optional upgrade,You can upgrade anytime if you want the additional features.,no
+sample-11,group-11,shipping@example.invalid,Your package arrived,Your package was delivered to your front door this morning.,no
+sample-12,group-12,team@example.invalid,All sorted,I already fixed the issue. Thanks for looking into it.,no

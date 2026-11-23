@@ -1,0 +1,5 @@
+-r requirements-gmail.txt
+dspy==3.5.0
+dspy-wsp==0.2.0
+huggingface-hub==2.4.0
+mlx==0.32.4
