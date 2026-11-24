@@ -17,7 +17,7 @@ weight edit on your own labeled mail and load the resulting profile.
 **JEV scored highest, and WeightSpace improved both local models.** Every
 run used the same 400 emails, frozen shared prompt, and 0.50 cutoff.
 
-![Weighted scores for five configurations. Striped bars show the two WeightSpace patches.](docs/assets/weighted-results.png)
+![Weighted scores for Omni 600M, d1-2B, and JEV. The two striped bars are labeled Weight-Space.](docs/assets/weighted-results.png)
 
 | Model | Weighted score | Missed / 47 | False alerts / 353 | Penalty |
 | --- | ---: | ---: | ---: | ---: |
