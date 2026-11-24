@@ -12,6 +12,7 @@ from urllib.parse import unquote, urlsplit
 
 from . import gmail
 from .inbox import CombinedInbox, Inbox
+from .jev import Jev, PROVIDERS
 from .profiles import STOCK, load_profile
 
 WEB = Path(__file__).resolve().parents[1] / "web" / "dist"
@@ -19,13 +20,14 @@ DEFAULT_DATA = Path.home() / "Library" / "Application Support" / "Omni Mail"
 
 
 class InboxService:
-    def __init__(self, inbox, mailboxes, model=None, profiles=None, worker=None, model_available=None):
+    def __init__(self, inbox, mailboxes, model=None, profiles=None, worker=None, model_available=None, jev=None):
         self.inbox = inbox
         self.mailboxes = mailboxes
         self.model = model
         self.profiles = profiles
         self.worker = worker
         self.model_available = model_available
+        self.jev = jev
         self.lock = Lock()
 
     def snapshot(self):
@@ -36,6 +38,16 @@ class InboxService:
                 {"id": key, "label": profile.label, "available": self.model_available(profile)}
                 for key, profile in self.profiles.items()
             ]
+        if self.jev:
+            providers = [
+                {"id": key, "label": spec[0], "connected": bool(self.jev.key(key))}
+                for key, spec in PROVIDERS.items()
+            ]
+            data["jev"] = providers
+            data["models"].extend(
+                {"id": "jev-" + provider["id"], "label": "JEV · " + provider["label"], "available": True}
+                for provider in providers if provider["connected"]
+            )
         return data
 
     def overview(self):
@@ -47,21 +59,63 @@ class InboxService:
             self.inbox.refresh()
             return self.snapshot()
 
+    def process(self, identifiers):
+        with self.lock:
+            snapshot = self.snapshot()
+            if snapshot["stage"] != "idle":
+                return {"error": "Wait for the current inbox pass to finish."}, 409
+            if identifiers is not None:
+                existing = {row["id"] for row in snapshot["threads"]}
+                if not identifiers <= existing:
+                    return {"error": "Some selected threads are no longer in the inbox."}, 409
+            if self.model and self.model.startswith("jev-"):
+                if not self.jev.key(self.model.removeprefix("jev-")):
+                    return {"error": "Connect a Jev API key to process mail."}, 422
+            elif self.profiles and not self.model_available(self.profiles[self.model]):
+                return {"error": "Download the selected model using the setup guide."}, 422
+            self.inbox.process(identifiers)
+            return self.snapshot(), 202
+
+    def _activate(self, key, version, factory):
+        for inbox in self.mailboxes:
+            inbox.activate(version, factory)
+        self.model = key
+        return self.snapshot(), 200
+
     def choose(self, key):
         with self.lock:
-            if not self.profiles or key not in self.profiles:
-                return {"error": "Unknown model."}, 404
             if key == self.model:
                 return self.snapshot(), 200
+            if self.inbox.overview()["stage"] != "idle":
+                return {"error": "Wait for the current inbox pass to finish."}, 409
+            provider = key.removeprefix("jev-")
+            if self.jev and key.startswith("jev-") and provider in PROVIDERS:
+                if not self.jev.key(provider):
+                    return {"error": "Connect an API key for this Jev provider."}, 422
+                return self._activate(key, self.jev.version(provider), lambda: self.jev.classifier(provider))
+            if not self.profiles or key not in self.profiles:
+                return {"error": "Unknown model."}, 404
             profile = self.profiles[key]
             if not self.model_available(profile):
                 return {"error": f"Download {profile.label} using the setup guide."}, 422
+            return self._activate(key, profile.version, lambda: self.worker.for_profile(profile))
+
+    def connect_jev(self, provider, key):
+        with self.lock:
+            if not self.jev or not isinstance(provider, str) or provider not in PROVIDERS:
+                return {"error": "Choose OpenRouter or TypeSafe."}, 400
             if self.inbox.overview()["stage"] != "idle":
                 return {"error": "Wait for the current inbox pass to finish."}, 409
-            for inbox in self.mailboxes:
-                inbox.activate(profile.version, lambda: self.worker.for_profile(profile))
-            self.model = key
-            return self.snapshot(), 202
+            try:
+                self.jev.save_key(provider, key)
+            except ValueError as error:
+                return {"error": str(error)}, 400
+            except OSError:
+                return {"error": "Couldn’t save the key in the local application directory."}, 500
+            model = "jev-" + provider
+            if self.model == model:
+                return self._activate(model, self.jev.version(provider), lambda: self.jev.classifier(provider))
+            return self.snapshot(), 200
 
 
 def server_handler(service):
@@ -100,11 +154,35 @@ def server_handler(service):
                 return super().do_GET()
             return self.response({"error": "Page not found."}, 404)
 
+        def read_json(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 32768:
+                raise ValueError
+            return json.loads(self.rfile.read(length))
+
         def do_POST(self):
             if not self.local_request() or self.headers.get("Origin") != "http://" + self.headers["Host"]:
                 return self.response({"error": "Omni Mail is local only."}, 403)
-            if self.path == "/api/refresh":
+            if self.path in {"/api/sync", "/api/refresh"}:
                 return self.response(service.refresh(), 202)
+            if self.path == "/api/process":
+                try:
+                    thread_ids = self.read_json()["thread_ids"]
+                    if thread_ids is not None and (not isinstance(thread_ids, list) or not thread_ids
+                                                   or not all(isinstance(key, str) for key in thread_ids)):
+                        raise ValueError
+                except (ValueError, KeyError, TypeError, UnicodeError):
+                    return self.response({"error": "Invalid thread selection."}, 400)
+                data, status = service.process(None if thread_ids is None else set(thread_ids))
+                return self.response(data, status)
+            if self.path == "/api/jev":
+                try:
+                    payload = self.read_json()
+                    provider, key = payload["provider"], payload["key"]
+                except (ValueError, KeyError, TypeError, UnicodeError):
+                    return self.response({"error": "Invalid Jev settings."}, 400)
+                data, status = service.connect_jev(provider, key)
+                return self.response(data, status)
             if self.path.startswith("/api/model/"):
                 data, status = service.choose(self.path.removeprefix("/api/model/"))
                 return self.response(data, status)
@@ -219,9 +297,11 @@ def main():
     else:
         inbox = Inbox(args.mode, args.data_dir, **options)
         mailboxes = [inbox]
-    service = InboxService(inbox, mailboxes, args.model, profiles, worker, available)
+    jev = Jev(args.data_dir) if profiles else None
+    service = InboxService(inbox, mailboxes, args.model, profiles, worker, available, jev)
     with ThreadingHTTPServer(("127.0.0.1", args.port), server_handler(service)) as server:
-        inbox.refresh()
+        if args.mode != "gmail":
+            inbox.refresh()
         print(f"Omni Mail: http://127.0.0.1:{server.server_port}", flush=True)
         try:
             server.serve_forever()

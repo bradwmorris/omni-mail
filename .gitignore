@@ -28,3 +28,4 @@ client_secret*.json
 !/omni-mail-lab/examples/
 /omni-mail-lab/examples/*
 !/omni-mail-lab/examples/sample-labels.csv
+jev-*.key

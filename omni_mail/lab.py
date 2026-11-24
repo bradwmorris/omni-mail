@@ -16,6 +16,12 @@ from .classifier import INPUTS
 from .profiles import read_patch_hashes
 
 
+WEIGHTSPACE_TENSORS = {
+    "omni-600m": ("head.scorer.0.weight", "head.scorer.0.bias", "head.scorer.3.weight"),
+    "d1-2b": ("model.language_model.layers.23.feed_forward.w2.weight",),
+}
+
+
 def load_rows(path):
     with path.open(encoding="utf-8-sig", newline="") as stream:
         rows = list(csv.DictReader(stream))
@@ -120,9 +126,7 @@ class CodexWriter:
 def tune_weights(model, program, train, validation, run_dir, writer_model, max_passes, cutoff):
     from dspy_wsp import WeightSpace
 
-    names = (("head.scorer.0.weight", "head.scorer.0.bias", "head.scorer.3.weight")
-             if model.profile.key == "omni-600m" else ("model.language_model.layers.23.feed_forward.w2.weight",))
-    pattern = "|".join(map(re.escape, names))
+    pattern = "|".join(map(re.escape, WEIGHTSPACE_TENSORS[model.profile.key]))
     optimizer = WeightSpace(
         metric=action_credit, writer_lm=CodexWriter(writer_model), backend=model.backend,
         run_dir=run_dir, max_passes=max_passes, max_turns=max_passes * 3,

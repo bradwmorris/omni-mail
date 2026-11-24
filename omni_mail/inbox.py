@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from threading import Lock, Thread
 
 from . import gmail
+from .jev import JevError
 from .sample import sample_threads
 
 
@@ -14,7 +15,7 @@ class Inbox:
     def __init__(self, mode, directory, classifier_version=None, classifier_factory=None):
         self.mode = mode
         self.directory = directory
-        self.classifier_version = classifier_version
+        self.classifier_version = "sample-fixtures-v1" if mode == "sample" else classifier_version
         self.classifier_factory = classifier_factory
         self.classifier = None
         self.db = directory / f"{mode}.sqlite3"
@@ -52,9 +53,9 @@ class Inbox:
         rows = []
         for thread in threads:
             target = thread["target"]
-            result = thread["sample_decision"] if self.mode == "sample" else decisions.get(target)
+            result = decisions.get(target)
             row = {key: thread[key] for key in ("id", "subject", "sender", "timestamp", "preview")}
-            row["decision"] = result or ("unavailable" if target in failed else "pending")
+            row["decision"] = result or ("unavailable" if target in failed else "unprocessed")
             rows.append(row)
         return {"mode": self.mode, "account": account, "synced": synced, "stage": stage,
                 "error": error, "limit": gmail.LIMIT, "threads": rows}
@@ -71,7 +72,6 @@ class Inbox:
                 return
             self.stage = "syncing"
             self.error = None
-            self.failed.clear()
         Thread(target=self._refresh, daemon=True).start()
 
     def activate(self, version, factory):
@@ -83,27 +83,42 @@ class Inbox:
             self.classifier = None
             self.failed.clear()
             self.error = None
-            self.stage = "classifying"
-        Thread(target=self._classify_snapshot, daemon=True).start()
 
-    def _classify_snapshot(self):
-        try:
+    def process(self, identifiers=None):
+        with self.lock:
+            if self.stage != "idle":
+                raise RuntimeError("Wait for the current inbox pass to finish.")
             _, _, threads, decisions = self.read()
-            self._classify(threads, decisions)
+            if identifiers is None:
+                work = [thread for thread in threads if thread["target"] not in decisions]
+            else:
+                work = [thread for thread in threads if thread["id"] in identifiers]
+            if not work:
+                return
+            self.stage = "classifying"
+            self.error = None
+            self.failed.difference_update(thread["target"] for thread in work)
+        Thread(target=self._process, args=(work,), daemon=True).start()
+
+    def _process(self, threads):
+        try:
+            self._classify(threads)
         finally:
             with self.lock:
                 self.stage = "idle"
 
     def _refresh(self):
         try:
-            previous_account, _, _, decisions = self.read()
+            previous_account, _, previous_threads, _ = self.read()
 
             def require_same_account(account):
                 if previous_account and account != previous_account:
                     raise gmail.ReconnectRequired
 
             if self.mode == "gmail":
-                account, threads = gmail.fetch_inbox(self.directory / "gmail-token.json", require_same_account)
+                account, threads = gmail.fetch_inbox(
+                    self.directory / "gmail-token.json", require_same_account, cached_threads=previous_threads,
+                )
             else:
                 account, threads = None, sample_threads()
 
@@ -118,10 +133,8 @@ class Inbox:
                     connection.execute(f"DELETE FROM decision WHERE message_id NOT IN ({marks})", latest)
                 else:
                     connection.execute("DELETE FROM decision")
-            if self.classifier_factory and any(thread["target"] not in decisions for thread in threads):
-                with self.lock:
-                    self.stage = "classifying"
-                self._classify(threads, decisions)
+            with self.lock:
+                self.failed.intersection_update(latest)
         except gmail.GmailAPIDisabled:
             with self.lock:
                 self.error = "The Gmail API is disabled in the OAuth project."
@@ -130,39 +143,49 @@ class Inbox:
                 self.error = "Reconnect the original Gmail account with the authorize command."
         except Exception:
             with self.lock:
-                self.error = "Sync failed. Refresh to try again."
+                self.error = "Sync failed. Click Sync mail to try again."
         finally:
             with self.lock:
                 self.stage = "idle"
 
-    def _classify(self, threads, decisions):
-        pending = [thread for thread in threads if thread["target"] not in decisions]
-        if not pending:
-            return
-        if self.classifier is None:
+    def _classify(self, threads):
+        if self.mode != "sample" and self.classifier is None:
             try:
                 self.classifier = self.classifier_factory()
             except Exception:
                 with self.lock:
-                    self.failed.update(thread["target"] for thread in pending)
-                    self.error = "Couldn’t start the local model. Check the notebook environment and model cache."
+                    self.failed.update(thread["target"] for thread in threads)
+                    self.error = "Couldn’t start the local model. Check the setup guide and model download."
                 return
-        for thread in pending:
-            target = next(message for message in thread["messages"] if message["id"] == thread["target"])
+        failures = 0
+        for thread in threads:
             try:
-                if target["body"] is None:
-                    raise ValueError("No readable message body.")
-                result = self.classifier(
-                    target["from"], target.get("subject", thread["subject"]), target["body"],
-                )
+                if self.mode == "sample":
+                    result = thread["sample_decision"]
+                else:
+                    target = next(message for message in thread["messages"] if message["id"] == thread["target"])
+                    if target["body"] is None:
+                        raise ValueError("No readable message body.")
+                    result = self.classifier(
+                        target["from"], target.get("subject", thread["subject"]), target["body"],
+                    )
                 with closing(sqlite3.connect(self.db)) as connection, connection:
                     connection.execute(
                         "INSERT OR REPLACE INTO decision VALUES (?, ?, ?)",
-                        (target["id"], self.classifier_version, result),
+                        (thread["target"], self.classifier_version, result),
                     )
-            except Exception:
+            except JevError as error:
                 with self.lock:
-                    self.failed.add(target["id"])
+                    self.failed.add(thread["target"])
+                    self.error = str(error)
+                return
+            except Exception:
+                failures += 1
+                with self.lock:
+                    self.failed.add(thread["target"])
+        if failures:
+            with self.lock:
+                self.error = f"Couldn’t process {failures} of {len(threads)} threads."
 
 
 class CombinedInbox:
@@ -201,3 +224,15 @@ class CombinedInbox:
     def refresh(self):
         for inbox in self.mailboxes.values():
             inbox.refresh()
+
+    def process(self, identifiers=None):
+        if identifiers is None:
+            for inbox in self.mailboxes.values():
+                inbox.process()
+            return
+        by_mailbox = {}
+        for identifier in identifiers:
+            name, _, thread_id = identifier.partition("/")
+            by_mailbox.setdefault(name, set()).add(thread_id)
+        for name, thread_ids in by_mailbox.items():
+            self.mailboxes[name].process(thread_ids)

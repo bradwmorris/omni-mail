@@ -1,6 +1,8 @@
 """Read-only, bounded Gmail inbox sync and desktop authorization."""
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr
@@ -65,7 +67,7 @@ def decode_raw(raw, html_to_text):
             "subject": str(mail.get("Subject", ""))}
 
 
-def fetch_inbox(token_file, cache_guard, *, limit=LIMIT, date_range=None):
+def fetch_inbox(token_file, cache_guard, *, limit=LIMIT, date_range=None, cached_threads=()):
     from bs4 import BeautifulSoup
     from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import AuthorizedSession
@@ -75,6 +77,7 @@ def fetch_inbox(token_file, cache_guard, *, limit=LIMIT, date_range=None):
         raise ReconnectRequired
     credentials = Credentials.from_authorized_user_file(str(token_file), scopes=[SCOPE])
     previous_token = credentials.token
+    cache = {thread["id"]: thread for thread in cached_threads} if date_range is None else {}
 
     def html_to_text(html):
         soup = BeautifulSoup(html, "html.parser")
@@ -84,26 +87,77 @@ def fetch_inbox(token_file, cache_guard, *, limit=LIMIT, date_range=None):
             br.replace_with("\n")
         return soup.get_text("\n", strip=True)
 
-    with AuthorizedSession(credentials) as session:
-        def read(path, **query):
-            url = f"{BASE_URL}/{path}"
-            if query:
-                url += "?" + urlencode(query)
-            try:
-                response = session.get(url, timeout=20)
-            except RefreshError:
-                raise ReconnectRequired from None
-            if response.status_code == 401:
-                raise ReconnectRequired
-            if response.status_code == 403:
-                errors = response.json().get("error", {}).get("details", [])
-                if any(error.get("reason") == "SERVICE_DISABLED" for error in errors):
-                    raise GmailAPIDisabled
-            response.raise_for_status()
-            return response.json()
+    def read(session, path, *, allow_missing=False, **query):
+        url = f"{BASE_URL}/{path}"
+        if query:
+            url += "?" + urlencode(query)
+        try:
+            response = session.get(url, timeout=(5, 15))
+        except RefreshError:
+            raise ReconnectRequired from None
+        if response.status_code == 401:
+            raise ReconnectRequired
+        if response.status_code == 404 and allow_missing:
+            return None
+        if response.status_code == 403:
+            errors = response.json().get("error", {}).get("details", [])
+            if any(error.get("reason") == "SERVICE_DISABLED" for error in errors):
+                raise GmailAPIDisabled
+        response.raise_for_status()
+        return response.json()
 
-        profile = read("profile")
-        account = profile["emailAddress"]
+    def load_thread(item, listing_session):
+        thread_id = item["id"]
+        history_id = item.get("historyId")
+        previous = cache.get(thread_id, {})
+        if history_id and history_id == previous.get("history_id"):
+            return previous
+
+        # Reuse immutable message text. Thread metadata supplies fresh
+        # membership and labels, including archived, sent and draft states.
+        cached_messages = {message["id"]: message for message in previous.get("messages", [])}
+        messages = []
+        complete = True
+        session_context = AuthorizedSession(credentials) if date_range is None else nullcontext(listing_session)
+        with session_context as session:
+            meta = read(session, "threads/" + thread_id, format="metadata", allow_missing=True)
+            if meta is None:
+                return None
+            for message in meta["messages"]:
+                labels = message.get("labelIds", [])
+                if "DRAFT" in labels:
+                    continue
+                cached = cached_messages.get(message["id"])
+                if cached is None:
+                    raw = read(session, "messages/" + message["id"], format="raw", allow_missing=True)
+                    if raw is None:
+                        complete = False
+                        continue
+                    messages.append(decode_raw(raw, html_to_text))
+                else:
+                    messages.append({
+                        **cached, "inbound_inbox": "INBOX" in labels and "SENT" not in labels,
+                    })
+        messages.sort(key=lambda message: message["timestamp"])
+        inbox = [message for message in messages if message["inbound_inbox"]]
+        if date_range:
+            first, last = date_range
+            inbox = [message for message in inbox
+                     if first <= message["timestamp"] < last and message["body"] is not None]
+        if not inbox:
+            return None
+        target = inbox[-1]
+        name, address = parseaddr(target["from"])
+        return {
+            "id": thread_id, "history_id": meta.get("historyId", history_id) if complete else None,
+            "subject": target["subject"] or "(No subject)",
+            "timestamp": messages[-1]["timestamp"], "sender": name or address or "Unknown sender",
+            "preview": " ".join((target["body"] or "").split())[:250], "target": target["id"],
+            "messages": messages,
+        }
+
+    with AuthorizedSession(credentials) as listing_session, ThreadPoolExecutor(max_workers=6) as pool:
+        account = read(listing_session, "profile")["emailAddress"]
         cache_guard(account)
         threads = []
         token = None
@@ -115,33 +169,17 @@ def fetch_inbox(token_file, cache_guard, *, limit=LIMIT, date_range=None):
                 query["q"] = f"after:{first - 1} before:{last}"
             if token:
                 query["pageToken"] = token
-            page = read("threads", **query)
+            page = read(listing_session, "threads", **query)
+            items = []
             for item in page.get("threads", []):
-                if item["id"] in seen:
-                    continue
-                seen.add(item["id"])
-                # Thread retrieval does not offer RAW. Fetch each message in RAW
-                # to let Python's MIME parser handle multipart and encodings.
-                meta = read("threads/" + item["id"], format="metadata")
-                messages = [
-                    decode_raw(read("messages/" + message["id"], format="raw"), html_to_text)
-                    for message in meta["messages"] if "DRAFT" not in message.get("labelIds", [])
-                ]
-                messages.sort(key=lambda message: message["timestamp"])
-                inbox = [message for message in messages if message["inbound_inbox"]]
-                if date_range:
-                    inbox = [message for message in inbox
-                             if first <= message["timestamp"] < last and message["body"] is not None]
-                if not inbox:
-                    continue
-                target = inbox[-1]
-                name, address = parseaddr(target["from"])
-                threads.append({
-                    "id": item["id"], "subject": target["subject"] or "(No subject)",
-                    "timestamp": messages[-1]["timestamp"], "sender": name or address or "Unknown sender",
-                    "preview": " ".join((target["body"] or "").split())[:250], "target": target["id"],
-                    "messages": messages,
-                })
+                if item["id"] not in seen:
+                    seen.add(item["id"])
+                    items.append(item)
+            if date_range:
+                loaded = (load_thread(item, listing_session) for item in items)
+            else:
+                loaded = pool.map(lambda item: load_thread(item, listing_session), items)
+            threads.extend(thread for thread in loaded if thread is not None)
             token = page.get("nextPageToken")
             if not token:
                 break
